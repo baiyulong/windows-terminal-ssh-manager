@@ -1,0 +1,1 @@
+"""wt-ssh-manager package"""
