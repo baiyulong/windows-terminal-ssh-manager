@@ -3,10 +3,20 @@
 /// `interactive_connect` puts the terminal in raw mode, then runs a
 /// bidirectional I/O loop between the keyboard (crossterm EventStream) and
 /// the SSH channel (russh channel.wait / channel.data).
+///
+/// Mouse events are forwarded to the SSH channel when the remote application
+/// enables VT mouse tracking (detected by scanning channel output for the
+/// `\x1b[?1000h` / `?1002h` / `?1003h` enable sequences).  SGR extended
+/// mouse encoding (`\x1b[?1006h`) is tracked so the forwarded sequences use
+/// the right format.  When the remote disables mouse tracking the forwarding
+/// is suspended and Windows Terminal resumes its native selection behaviour.
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     terminal,
 };
 use futures::StreamExt;
@@ -65,6 +75,84 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     }
 }
 
+// ── mouse → VT escape bytes ───────────────────────────────────────────────────
+
+/// Convert a crossterm mouse event into the appropriate VT escape sequence.
+///
+/// * `sgr = false` → classic X10 encoding  (`ESC [ M <b> <x> <y>`, 1-indexed,
+///   limited to col/row ≤ 223)
+/// * `sgr = true`  → SGR encoding (`ESC [ < Ps ; Px ; Py M/m`), unlimited range
+fn mouse_to_bytes(mouse: MouseEvent, sgr: bool) -> Vec<u8> {
+    let col = mouse.column + 1; // 1-indexed
+    let row = mouse.row + 1;
+
+    let (btn, is_release) = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)   => (0u16, false),
+        MouseEventKind::Down(MouseButton::Middle) => (1u16, false),
+        MouseEventKind::Down(MouseButton::Right)  => (2u16, false),
+        MouseEventKind::Up(MouseButton::Left)     => (0u16, true),
+        MouseEventKind::Up(MouseButton::Middle)   => (1u16, true),
+        MouseEventKind::Up(_)                     => (2u16, true), // Right + unknown
+        MouseEventKind::Drag(MouseButton::Left)   => (32u16, false),
+        MouseEventKind::Drag(MouseButton::Middle) => (33u16, false),
+        MouseEventKind::Drag(MouseButton::Right)  => (34u16, false),
+        MouseEventKind::ScrollUp                  => (64u16, false),
+        MouseEventKind::ScrollDown                => (65u16, false),
+        // Moved without button / other — skip
+        _ => return vec![],
+    };
+
+    let mut btn_code = btn;
+    if mouse.modifiers.contains(KeyModifiers::SHIFT)   { btn_code += 4; }
+    if mouse.modifiers.contains(KeyModifiers::ALT)     { btn_code += 8; }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) { btn_code += 16; }
+
+    if sgr {
+        // SGR: ESC [ < Ps ; Px ; Py M  (press/drag)  or  …m  (release)
+        let suffix = if is_release { 'm' } else { 'M' };
+        format!("\x1b[<{};{};{}{}", btn_code, col, row, suffix).into_bytes()
+    } else {
+        // X10: limited to 223 cols/rows (value + 32 must fit in one byte)
+        if col > 223 || row > 223 {
+            return vec![];
+        }
+        vec![0x1b, b'[', b'M', btn_code as u8 + 32, col as u8 + 32, row as u8 + 32]
+    }
+}
+
+// ── VT mouse-mode detector ────────────────────────────────────────────────────
+
+/// Scan a chunk of server output for VT mouse-mode enable/disable sequences
+/// and update `mouse_enabled` / `sgr_mode` accordingly.
+///
+/// Sequences detected:
+///   enable  : `?1000h` (X10), `?1002h` (button), `?1003h` (any-event)
+///   disable : `?1000l`, `?1002l`, `?1003l`
+///   SGR ext : `?1006h`  (extended SGR mouse encoding)
+fn update_mouse_state(data: &[u8], mouse_enabled: &mut bool, sgr_mode: &mut bool) {
+    if !data.contains(&0x1b) {
+        return; // fast path: no escape sequences
+    }
+    let s = String::from_utf8_lossy(data);
+
+    if s.contains("\x1b[?1000h")
+        || s.contains("\x1b[?1002h")
+        || s.contains("\x1b[?1003h")
+    {
+        *mouse_enabled = true;
+    }
+    if s.contains("\x1b[?1006h") {
+        *sgr_mode = true;
+    }
+    if s.contains("\x1b[?1000l")
+        || s.contains("\x1b[?1002l")
+        || s.contains("\x1b[?1003l")
+    {
+        *mouse_enabled = false;
+        *sgr_mode = false;
+    }
+}
+
 // ── RAII guard for raw mode ───────────────────────────────────────────────────
 
 struct RawMode;
@@ -107,12 +195,15 @@ pub async fn interactive_connect(
     let _raw = RawMode::enable()?;
     let mut stdout = std::io::stdout();
     let mut events = EventStream::new();
+    let mut mouse_enabled = false;
+    let mut sgr_mode = false;
 
     loop {
         tokio::select! {
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { ref data }) => {
+                        update_mouse_state(data, &mut mouse_enabled, &mut sgr_mode);
                         stdout.write_all(data)?;
                         stdout.flush()?;
                     }
@@ -134,6 +225,12 @@ pub async fn interactive_connect(
                             || key.kind == KeyEventKind::Repeat =>
                     {
                         let bytes = key_to_bytes(key);
+                        if !bytes.is_empty() {
+                            channel.data(bytes.as_slice()).await?;
+                        }
+                    }
+                    Some(Ok(Event::Mouse(mouse))) if mouse_enabled => {
+                        let bytes = mouse_to_bytes(mouse, sgr_mode);
                         if !bytes.is_empty() {
                             channel.data(bytes.as_slice()).await?;
                         }
