@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: [rust]
+    tags:     ["v*.*.*"]
+  pull_request:
+    branches: [rust]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build & test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test binary
+        run: |
+          .\target\release\ssh-manager.exe --version
+          .\target\release\ssh-manager.exe --help
+
+      - name: Upload artifact (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-manager-windows-x86_64
+          path: target/release/ssh-manager.exe
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ssh-manager-windows-x86_64
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ssh-manager.exe
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download `ssh-manager.exe` and place it anywhere on your `PATH`
+            (e.g. `%LOCALAPPDATA%\Microsoft\WindowsApps\`), then run:
+
+            ```
+            ssh-manager sync
+            ```
+
+            Windows Terminal profiles will be injected automatically.
