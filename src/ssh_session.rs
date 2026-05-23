@@ -6,7 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
 use futures::StreamExt;
@@ -129,7 +129,10 @@ pub async fn interactive_connect(
             }
             maybe_event = events.next() => {
                 match maybe_event {
-                    Some(Ok(Event::Key(key))) => {
+                    Some(Ok(Event::Key(key)))
+                        if key.kind == KeyEventKind::Press
+                            || key.kind == KeyEventKind::Repeat =>
+                    {
                         let bytes = key_to_bytes(key);
                         if !bytes.is_empty() {
                             channel.data(bytes.as_slice()).await?;
