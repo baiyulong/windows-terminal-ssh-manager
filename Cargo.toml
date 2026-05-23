@@ -1,0 +1,28 @@
+[package]
+name = "ssh-manager"
+version = "0.1.0"
+edition = "2021"
+description = "Windows Terminal SSH Manager — standalone binary, no Python required"
+
+[[bin]]
+name = "ssh-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow       = "1"
+async-trait  = "0.1"
+base64       = "0.22"
+clap         = { version = "4", features = ["derive"] }
+colored      = "2"
+comfy-table  = "7"
+crossterm    = { version = "0.28", features = ["event-stream"] }
+dialoguer    = { version = "0.11", features = ["fuzzy-select"] }
+dirs         = "5"
+futures      = "0.3"
+russh        = "0.49"
+russh-keys   = "0.49"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tokio        = { version = "1", features = ["full"] }
+ssh-key      = "0.6"
+uuid         = { version = "1", features = ["v5"] }
