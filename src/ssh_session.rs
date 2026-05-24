@@ -14,7 +14,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste,
+        DisableBracketedPaste, DisableFocusChange, EnableFocusChange,
         Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
         MouseButton, MouseEvent, MouseEventKind,
     },
@@ -173,15 +173,23 @@ struct RawMode;
 impl RawMode {
     fn enable() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        // Tell Windows Terminal to deliver paste as a single bracketed event
-        // instead of expanding it into individual KEY_EVENT records.
-        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        // Do NOT pre-enable bracketed paste here.  The remote shell (bash) will
+        // send `\x1b[?2004h` shortly after login; we forward it to local stdout,
+        // which causes Windows Terminal to enable bracketed paste automatically.
+        // Pre-enabling it ourselves creates a feedback loop: WT sends
+        // `\x1b[?2004h` back into our stdin as KEY_EVENT records, which we then
+        // forward to the SSH channel — appearing as garbage in remote input boxes.
+        //
+        // Enable focus-change reporting so we can forward FocusGained/FocusLost
+        // to the remote application (e.g. vim, Copilot).
+        let _ = execute!(std::io::stdout(), EnableFocusChange);
         Ok(Self)
     }
 }
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        let mut out = std::io::stdout();
+        let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -270,6 +278,12 @@ pub async fn interactive_connect(
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                         let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                    Some(Ok(Event::FocusGained)) => {
+                        let _ = channel.data(b"\x1b[I" as &[u8]).await;
+                    }
+                    Some(Ok(Event::FocusLost)) => {
+                        let _ = channel.data(b"\x1b[O" as &[u8]).await;
                     }
                     None => break,
                     _ => {}
