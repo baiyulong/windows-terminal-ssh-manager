@@ -14,9 +14,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
     event::{
+        DisableBracketedPaste, EnableBracketedPaste,
         Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
         MouseButton, MouseEvent, MouseEventKind,
     },
+    execute,
     terminal,
 };
 use futures::StreamExt;
@@ -123,13 +125,19 @@ fn mouse_to_bytes(mouse: MouseEvent, sgr: bool) -> Vec<u8> {
 // ── VT mouse-mode detector ────────────────────────────────────────────────────
 
 /// Scan a chunk of server output for VT mouse-mode enable/disable sequences
-/// and update `mouse_enabled` / `sgr_mode` accordingly.
+/// and update `mouse_enabled` / `sgr_mode` / `bracketed_paste` accordingly.
 ///
 /// Sequences detected:
 ///   enable  : `?1000h` (X10), `?1002h` (button), `?1003h` (any-event)
 ///   disable : `?1000l`, `?1002l`, `?1003l`
 ///   SGR ext : `?1006h`  (extended SGR mouse encoding)
-fn update_mouse_state(data: &[u8], mouse_enabled: &mut bool, sgr_mode: &mut bool) {
+///   paste   : `?2004h` (bracketed paste enable), `?2004l` (disable)
+fn update_mouse_state(
+    data: &[u8],
+    mouse_enabled: &mut bool,
+    sgr_mode: &mut bool,
+    bracketed_paste: &mut bool,
+) {
     if !data.contains(&0x1b) {
         return; // fast path: no escape sequences
     }
@@ -151,6 +159,12 @@ fn update_mouse_state(data: &[u8], mouse_enabled: &mut bool, sgr_mode: &mut bool
         *mouse_enabled = false;
         *sgr_mode = false;
     }
+    if s.contains("\x1b[?2004h") {
+        *bracketed_paste = true;
+    }
+    if s.contains("\x1b[?2004l") {
+        *bracketed_paste = false;
+    }
 }
 
 // ── RAII guard for raw mode ───────────────────────────────────────────────────
@@ -159,11 +173,15 @@ struct RawMode;
 impl RawMode {
     fn enable() -> Result<Self> {
         terminal::enable_raw_mode()?;
+        // Tell Windows Terminal to deliver paste as a single bracketed event
+        // instead of expanding it into individual KEY_EVENT records.
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
         Ok(Self)
     }
 }
 impl Drop for RawMode {
     fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -197,13 +215,14 @@ pub async fn interactive_connect(
     let mut events = EventStream::new();
     let mut mouse_enabled = false;
     let mut sgr_mode = false;
+    let mut remote_bracketed_paste = false;
 
     loop {
         tokio::select! {
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { ref data }) => {
-                        update_mouse_state(data, &mut mouse_enabled, &mut sgr_mode);
+                        update_mouse_state(data, &mut mouse_enabled, &mut sgr_mode, &mut remote_bracketed_paste);
                         stdout.write_all(data)?;
                         stdout.flush()?;
                     }
@@ -228,6 +247,20 @@ pub async fn interactive_connect(
                         if !bytes.is_empty() {
                             channel.data(bytes.as_slice()).await?;
                         }
+                    }
+                    // Paste arrives as a single Event::Paste when bracketed-paste
+                    // mode is active locally.  Wrap with the remote's bracketed
+                    // paste markers if the remote application expects them.
+                    Some(Ok(Event::Paste(text))) => {
+                        let bytes: Vec<u8> = if remote_bracketed_paste {
+                            let mut v = b"\x1b[200~".to_vec();
+                            v.extend_from_slice(text.as_bytes());
+                            v.extend_from_slice(b"\x1b[201~");
+                            v
+                        } else {
+                            text.into_bytes()
+                        };
+                        channel.data(bytes.as_slice()).await?;
                     }
                     Some(Ok(Event::Mouse(mouse))) if mouse_enabled => {
                         let bytes = mouse_to_bytes(mouse, sgr_mode);
