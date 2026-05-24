@@ -24,7 +24,7 @@ use crossterm::{
 use futures::StreamExt;
 use russh::{client, ChannelMsg};
 use ssh_key::PublicKey;
-use std::{io::Write, sync::Arc};
+use std::{io::Write, sync::Arc, time::Duration};
 
 // ── russh client handler ──────────────────────────────────────────────────────
 
@@ -194,6 +194,40 @@ impl Drop for RawMode {
     }
 }
 
+// ── VT escape-sequence filter ─────────────────────────────────────────────────
+
+/// Filters VT escape sequences that Windows Terminal injects into our stdin
+/// as responses to terminal queries forwarded from the remote app.
+///
+/// When the remote app (e.g. Copilot CLI) sends `\x1b]4;N;?` to query the
+/// terminal colour palette, we forward it to local stdout → Windows Terminal
+/// processes it and writes the answer back into our stdin as raw KEY_EVENT
+/// records.  Without filtering these would be forwarded to SSH and appear as
+/// garbage text in the remote app's input buffer.
+///
+/// State transitions:
+///   Normal   + ESC          → EscSeen
+///   EscSeen  + '['          → Csi       (CSI sequence, filter it)
+///   EscSeen  + ']'          → Osc       (OSC sequence, filter it)
+///   EscSeen  + ESC          → flush ESC, stay EscSeen  (double-ESC)
+///   EscSeen  + other        → flush ESC + key → Normal
+///   Csi      + '@'..='~'    → Normal    (CSI final byte)
+///   Csi      + ESC          → EscSeen   (unexpected restart)
+///   Csi      + other        → Csi       (CSI parameter bytes)
+///   Osc      + BEL (0x07)   → Normal    (BEL terminates OSC)
+///   Osc      + ESC          → OscEsc
+///   Osc      + other        → Osc
+///   OscEsc   + '\'          → Normal    (ST = ESC \ terminates OSC)
+///   OscEsc   + other        → Osc       (false alarm, back to OSC)
+#[derive(PartialEq)]
+enum EscFilter {
+    Normal,
+    EscSeen,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 /// Open an interactive SSH shell (connects, authenticates, then loops I/O).
@@ -224,10 +258,17 @@ pub async fn interactive_connect(
     let mut mouse_enabled = false;
     let mut sgr_mode = false;
     let mut remote_bracketed_paste = false;
+    let mut esc_filter = EscFilter::Normal;
 
     loop {
         tokio::select! {
             msg = channel.wait() => {
+                // Flush any pending ESC before writing remote output so that
+                // remote editors (vim, nano) receive the ESC promptly.
+                if esc_filter == EscFilter::EscSeen {
+                    let _ = channel.data(b"\x1b" as &[u8]).await;
+                    esc_filter = EscFilter::Normal;
+                }
                 match msg {
                     Some(ChannelMsg::Data { ref data }) => {
                         update_mouse_state(data, &mut mouse_enabled, &mut sgr_mode, &mut remote_bracketed_paste);
@@ -251,15 +292,76 @@ pub async fn interactive_connect(
                         if key.kind == KeyEventKind::Press
                             || key.kind == KeyEventKind::Repeat =>
                     {
-                        let bytes = key_to_bytes(key);
-                        if !bytes.is_empty() {
-                            channel.data(bytes.as_slice()).await?;
+                        match esc_filter {
+                            EscFilter::Normal => {
+                                if key.code == KeyCode::Esc {
+                                    esc_filter = EscFilter::EscSeen;
+                                } else {
+                                    let bytes = key_to_bytes(key);
+                                    if !bytes.is_empty() {
+                                        channel.data(bytes.as_slice()).await?;
+                                    }
+                                }
+                            }
+                            EscFilter::EscSeen => match key.code {
+                                KeyCode::Char('[') => {
+                                    // Looks like a CSI response injected by WT — filter it
+                                    esc_filter = EscFilter::Csi;
+                                }
+                                KeyCode::Char(']') => {
+                                    // OSC response from WT (e.g. colour palette answer) — filter it
+                                    esc_filter = EscFilter::Osc;
+                                }
+                                KeyCode::Esc => {
+                                    // Double-ESC: send the first, hold the second
+                                    let _ = channel.data(b"\x1b" as &[u8]).await;
+                                    // esc_filter stays EscSeen
+                                }
+                                _ => {
+                                    // Not a VT response — flush the buffered ESC then send this key
+                                    esc_filter = EscFilter::Normal;
+                                    let _ = channel.data(b"\x1b" as &[u8]).await;
+                                    let bytes = key_to_bytes(key);
+                                    if !bytes.is_empty() {
+                                        channel.data(bytes.as_slice()).await?;
+                                    }
+                                }
+                            },
+                            EscFilter::Csi => match key.code {
+                                // CSI final byte is in 0x40–0x7E ('@'..='~')
+                                KeyCode::Char(c) if matches!(c, '@'..='~') => {
+                                    esc_filter = EscFilter::Normal;
+                                }
+                                KeyCode::Esc => {
+                                    // Unexpected ESC inside CSI — treat as a fresh escape
+                                    esc_filter = EscFilter::EscSeen;
+                                }
+                                _ => {} // parameter bytes — keep filtering
+                            },
+                            EscFilter::Osc => match key.code {
+                                KeyCode::Char('\x07') => {
+                                    esc_filter = EscFilter::Normal; // BEL terminates OSC
+                                }
+                                KeyCode::Esc => {
+                                    esc_filter = EscFilter::OscEsc; // might be ST (ESC \)
+                                }
+                                _ => {} // OSC content — keep filtering
+                            },
+                            EscFilter::OscEsc => match key.code {
+                                KeyCode::Char('\\') => {
+                                    esc_filter = EscFilter::Normal; // ST = ESC \ terminates OSC
+                                }
+                                _ => {
+                                    esc_filter = EscFilter::Osc; // not ST — back to OSC
+                                }
+                            },
                         }
                     }
-                    // Paste arrives as a single Event::Paste when bracketed-paste
-                    // mode is active locally.  Wrap with the remote's bracketed
-                    // paste markers if the remote application expects them.
                     Some(Ok(Event::Paste(text))) => {
+                        if esc_filter == EscFilter::EscSeen {
+                            let _ = channel.data(b"\x1b" as &[u8]).await;
+                            esc_filter = EscFilter::Normal;
+                        }
                         let bytes: Vec<u8> = if remote_bracketed_paste {
                             let mut v = b"\x1b[200~".to_vec();
                             v.extend_from_slice(text.as_bytes());
@@ -288,6 +390,14 @@ pub async fn interactive_connect(
                     None => break,
                     _ => {}
                 }
+            }
+            // If the user pressed Esc but nothing followed within 100 ms,
+            // flush it so remote editors (vim, nano) stay responsive.
+            _ = tokio::time::sleep(Duration::from_millis(100)),
+                if esc_filter == EscFilter::EscSeen =>
+            {
+                let _ = channel.data(b"\x1b" as &[u8]).await;
+                esc_filter = EscFilter::Normal;
             }
         }
     }
